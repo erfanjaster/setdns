@@ -12,11 +12,11 @@
 #  * Dry-run, live verification (dig/nslookup/host/python3/getent fallbacks)
 #  * Atomic write, temp-file trap, no dependencies required
 #
-#  Version 1.3.0
+#  Version 1.4.0
 #
 set -Eeuo pipefail
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 TARGET="/etc/resolv.conf"
 SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 
@@ -58,6 +58,14 @@ declare -A P_NOTE=(
   [verisign]="Privacy focused; no-log, no-sale policy."
 )
 
+# Optional DoT (DNS-over-TLS) fingerprints — used by --dot when generating a
+# systemd-resolved drop-in. Add yours the same way as the P_* arrays above.
+declare -A P_DOT_FP=(
+  [cloudflare]="D7A7D0F5C16AF876CE7D129B32CD056DE738FF1DC87B6E26275FCAD8C795ACFEAD95F0356D7377DEB44E7B2E80471DB2"
+  [google]="445FF7523759B453EF66C88AB25B8A9839A4BEEFB531DB18598D966CA3C5A5E8"
+  [quad9]="AFBEB90848507ECF459C846F6F8A9E9535273F0AC33CC57F8FC0509A0DA3E362"
+)
+
 # --------------------------------------------------------------------------
 # Defaults
 # --------------------------------------------------------------------------
@@ -81,6 +89,10 @@ SEL_SERVERS=""
 SEL_LABEL="custom"
 BLOCK_LABEL="custom"
 TMP_FILE=""
+PROFILE_MODE=0
+DOT_MODE=0
+DROPIN_DIR="/etc/systemd/resolved.conf.d"
+SEL_KEY=""
 
 # --------------------------------------------------------------------------
 # Output helpers (safe under `set -e`: last command always returns 0)
@@ -112,7 +124,10 @@ norm() { printf '%s' "$*" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ' |
 # --------------------------------------------------------------------------
 # Usage
 # --------------------------------------------------------------------------
+# Print usage, but only after an external profile has been loaded (so the
+# PROVIDERS list in --help is accurate).
 usage() {
+  if [[ -n "${PROFILE_FILE:-}" ]]; then load_profile "$PROFILE_FILE"; fi
 cat <<EOF
 ${C_BOLD}setdns.sh${C_RESET} v${VERSION} — switch your system DNS provider
 
@@ -149,6 +164,11 @@ ${C_BOLD}FLAGS${C_RESET}
   -f, --force             skip prompts and manager warnings
       --replace-symlink   replace a symlinked resolv.conf with a real file
       --no-verify         skip the post-apply resolution test
+      --profile FILE      read servers from an external profile file instead
+                          of the built-in table (see --make-profile)
+      --make-profile      print a starter profile file to stdout
+      --dot               with --resolved: also generate a DNS-over-TLS
+                          drop-in in ${DROPIN_DIR} (needs a provider name)
   -q, --quiet             minimal output
   -h, --help              show this help
   -V, --version           show version
@@ -157,6 +177,9 @@ ${C_BOLD}EXAMPLES${C_RESET}
   sudo ./setdns.sh cloudflare
   sudo ./setdns.sh 3 --no-ipv6 --lock
   sudo ./setdns.sh --resolved google
+  sudo ./setdns.sh --resolved --dot cloudflare
+  sudo ./setdns.sh --profile ~/my-profiles.txt work
+  ./setdns.sh --make-profile > my-providers.txt
   sudo ./setdns.sh --restore
   sudo ./setdns.sh --dry-run "9.9.9.9 149.112.112.112"
 EOF
@@ -172,7 +195,68 @@ list_providers() {
     printf '       %sIPv6:%s %s\n' "$C_DIM" "$C_RESET" "${P_V6[$key]}"
     printf '       %s%s%s\n\n' "$C_DIM" "${P_NOTE[$key]}" "$C_RESET"
   done
-  printf '  %sTip:%s add your own provider by editing the PROVIDERS/P_* arrays at the top.\n' "$C_DIM" "$C_RESET"
+  printf '  %sTip:%s add your own provider by editing the PROVIDERS/P_* arrays at the top,\n' "$C_DIM" "$C_RESET"
+  printf '       %sor keep them outside the script with --profile FILE (see --make-profile).%s\n' "$C_DIM" "$C_RESET"
+}
+
+# --------------------------------------------------------------------------
+# External profiles — same data, kept out of the script
+#   key|label|ipv4 servers|ipv6 servers|note[|DoT fingerprint]
+# The file may contain comments (#) and blank lines. Later entries win if a
+# key is repeated, so you can override built-ins without editing the script.
+# --------------------------------------------------------------------------
+PROFILE_FILE=""
+
+load_profile() {
+  local file="$1" line key label v4 v6 note fp
+  [[ -r "$file" ]] || die "Profile file not readable: $file"
+  local -a fields=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"                            # strip trailing comments
+    [[ -n "$(norm "$line")" ]] || continue
+    IFS='|' read -r -a fields <<<"$line"
+    key="$(norm "${fields[0]:-}")"
+    [[ -n "$key" ]] || continue
+    [[ "$key" =~ ^[A-Za-z0-9._-]+$ ]] || \
+      die "Bad profile key '${key}' in ${file} (use letters, digits, . _ -)."
+    label="${fields[1]:-}"
+    [[ -n "$(norm "$label")" ]] || label="$key"
+    v4="$(norm "${fields[2]:-}")"
+    v6="$(norm "${fields[3]:-}")"
+    note="${fields[4]:-}"
+    fp="$(norm "${fields[5]:-}")"
+    local w
+    for w in $v4 $v6; do
+      valid_ip "$w" || die "Profile '${key}': invalid IP '${w}' in ${file}"
+    done
+    # register (or override) the entry
+    local found=0 p
+    for p in "${PROVIDERS[@]}"; do [[ "$p" == "$key" ]] && { found=1; break; }; done
+    (( found )) || PROVIDERS+=("$key")
+    P_LABEL[$key]="$label"
+    P_V4[$key]="$v4"
+    P_V6[$key]="$v6"
+    P_NOTE[$key]="$note"
+    [[ -n "$fp" ]] && P_DOT_FP[$key]="$fp"
+  done < "$file"
+  return 0
+}
+
+make_profile() {
+  local i key fp
+  cat <<EOF
+# setdns.sh profile file — generated v${VERSION}
+# Format: key|label|ipv4 servers|ipv6 servers|note[|DoT certificate SHA256 fingerprint]
+# Use with: sudo setdns.sh --profile THISFILE <key>
+$(for i in "${!PROVIDERS[@]}"; do
+  key="${PROVIDERS[$i]}"
+  fp="${P_DOT_FP[$key]:-}"
+  printf '%s|%s|%s|%s|%s%s\n' "$key" "${P_LABEL[$key]}" "${P_V4[$key]}" \
+         "${P_V6[$key]}" "${P_NOTE[$key]}" "${fp:+|$fp}"
+done)
+# Add your own below — e.g. a LAN resolver or a Pi-hole:
+# home|Home Pi-hole|192.168.1.10||Blocks ads on the LAN.|
+EOF
 }
 
 # --------------------------------------------------------------------------
@@ -576,6 +660,66 @@ apply_resolved() {
   return 0
 }
 
+# Generate a persistent systemd-resolved drop-in. With --dot the provider's
+# certificate fingerprint is pinned (server~SHA256) and DNSOverTLS=yes; without
+# it only a plain DNS= line is written.
+apply_dropin() {
+  local servers="$1" key="$2" dot="$3"
+  local conf="${DROPIN_DIR}/setdns.conf" tmp s list="" out=""
+  have systemctl || die "systemctl not found; drop-ins only work with systemd."
+  [[ -d "$DROPIN_DIR" ]] || die "${DROPIN_DIR} does not exist — no systemd-resolved here."
+
+  for s in $servers; do
+    [[ "$s" == *:* ]] && ! ipv6_enabled && continue
+    if (( dot == 1 )) && [[ -n "${P_DOT_FP[$key]:-}" ]]; then
+      out+="${out:+ }${s}~${P_DOT_FP[$key]}"
+    else
+      list+="${list:+ }${s}"
+    fi
+  done
+  if (( dot == 1 )) && [[ -z "$out" ]]; then
+    warn "No DoT fingerprint known for '${key}' — writing servers unpinned."
+  fi
+  local dnsval="${out:-$list}"
+  [[ -n "$dnsval" ]] || die "No nameservers to write into the drop-in."
+
+  tmp="$(mktemp "${TMPDIR:-/tmp}/setdns-dropin.XXXXXX")"
+  TMP_FILE="$tmp"
+  {
+    printf '# Generated by setdns.sh v%s on %s\n' "$VERSION" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+    [[ -n "$key" ]] && printf '# Provider: %s\n' "$key"
+    printf '[Resolve]\nDNS=%s\n' "$dnsval"
+    if (( dot == 1 )); then printf 'DNSOverTLS=yes\n'; fi
+    true
+  } > "$tmp"
+
+  title "[drop-in] Contents of ${conf}"
+  sed 's/^/  /' "$tmp"; echo
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    info "[dry-run] nothing written; would also run: systemctl restart systemd-resolved"
+    return 0
+  fi
+
+  mkdir -p "$DROPIN_DIR" 2>/dev/null || die "Cannot create ${DROPIN_DIR} (need root?)."
+  cp -f "$tmp" "$conf" || die "Could not write ${conf}."
+  chmod 644 "$conf"
+  TMP_FILE=""
+  rm -f "$tmp"
+  ok "Wrote ${C_BOLD}${conf}${C_RESET}"
+
+  if systemctl restart systemd-resolved 2>/dev/null; then
+    ok "Restarted systemd-resolved — settings persist across reboots."
+  else
+    warn "Could not restart systemd-resolved automatically; do it manually:"
+    warn "  sudo systemctl restart systemd-resolved"
+  fi
+  if (( dot == 1 )); then
+    info "DNS-over-TLS enabled. Verify with: resolvectl status"
+  fi
+  return 0
+}
+
 apply_nmcli() {
   local servers="$1" conn iface list="" s
   have nmcli || die "nmcli not found; cannot use --nm on this system."
@@ -677,6 +821,7 @@ resolve_selection() {
     key="${PROVIDERS[$((sel - 1))]}"
     SEL_SERVERS="${P_V4[$key]} ${P_V6[$key]}"
     SEL_LABEL="${P_LABEL[$key]}"
+    SEL_KEY="$key"
     return 0
   fi
 
@@ -684,6 +829,7 @@ resolve_selection() {
     if [[ "$key" == "$sel" ]]; then
       SEL_SERVERS="${P_V4[$key]} ${P_V6[$key]}"
       SEL_LABEL="${P_LABEL[$key]}"
+      SEL_KEY="$key"
       return 0
     fi
   done
@@ -705,7 +851,9 @@ resolve_selection() {
 set_provider() {
   resolve_selection "$1"
   need_root
-  if [[ $RESOLVED_MODE -eq 1 ]]; then
+  if [[ $PROFILE_MODE -eq 1 ]]; then
+    apply_dropin "$SEL_SERVERS" "$SEL_KEY" "$DOT_MODE"
+  elif [[ $RESOLVED_MODE -eq 1 ]]; then
     apply_resolved "$SEL_SERVERS"
   elif [[ $NM_MODE -eq 1 ]]; then
     apply_nmcli "$SEL_SERVERS"
@@ -765,25 +913,25 @@ selftest() {
   assert_true "a backup was created"            bash -c "ls ${rc_conf}.bak.* >/dev/null 2>&1"
 
   # 4 — apply by provider name
-  run --no-verify -q --ipv6 -t "$rc_conf" google >/dev/null 2>&1
+  run --no-verify -q --force --ipv6 -t "$rc_conf" google >/dev/null 2>&1
   assert_true "name 'google' writes 8.8.8.8"    grep -q '^nameserver 8.8.8.8$' "$rc_conf"
   assert_true "--ipv6 includes IPv6 server"     grep -q '^nameserver 2001:4860:4860::8888$' "$rc_conf"
 
   # 5 — IPv4-only mode
-  run --no-verify -q --no-ipv6 -t "$rc_conf" quad9 >/dev/null 2>&1
+  run --no-verify -q --force --no-ipv6 -t "$rc_conf" quad9 >/dev/null 2>&1
   assert_true  "--no-ipv6 writes 9.9.9.9"       grep -q '^nameserver 9.9.9.9$' "$rc_conf"
   assert_false "--no-ipv6 omits IPv6"           grep -q '^nameserver 2620:' "$rc_conf"
 
   # 6 — trailing newline + resolver options
   assert_eq "file ends with a newline" "0" \
     "$(bash -c '[ "$(tail -c 1 '"$rc_conf"' | od -An -c | tr -d " \n")" = "\n" ]'; echo $?)"
-  run --no-verify -q --no-ipv6 -t "$rc_conf" adguard >/dev/null 2>&1
+  run --no-verify -q --force --no-ipv6 -t "$rc_conf" adguard >/dev/null 2>&1
   assert_true "options line present" grep -q '^options edns0' "$rc_conf"
-  run --no-verify -q --no-options --no-ipv6 -t "$rc_conf" adguard >/dev/null 2>&1
+  run --no-verify -q --force --no-options --no-ipv6 -t "$rc_conf" adguard >/dev/null 2>&1
   assert_false "--no-options drops it" grep -q '^options ' "$rc_conf"
 
   # 7 — custom addresses
-  run --no-verify -q -t "$rc_conf" "1.1.1.1 9.9.9.9" >/dev/null 2>&1
+  run --no-verify -q --force -t "$rc_conf" "1.1.1.1 9.9.9.9" >/dev/null 2>&1
   assert_eq "custom IPs written" "2" "$(grep -c '^nameserver ' "$rc_conf")"
   assert_true "custom IP 9.9.9.9 present" grep -q '^nameserver 9.9.9.9$' "$rc_conf"
 
@@ -797,22 +945,22 @@ selftest() {
 
   # 9 — restore round-trip
   printf 'nameserver 10.20.30.40\n' > "$rc_conf"
-  run --no-verify -q -t "$rc_conf" cloudflare >/dev/null 2>&1
+  run --no-verify -q --force -t "$rc_conf" cloudflare >/dev/null 2>&1
   run --no-verify -q -t "$rc_conf" --restore >/dev/null 2>&1
   assert_eq "--restore brings back previous content" "nameserver 10.20.30.40" "$(cat "$rc_conf")"
 
   # 10 — backup pruning
   rm -f "${rc_conf}".bak.* 2>/dev/null || true
   local i
-  for i in 1 2 3 4 5; do run --no-verify -q --keep 2 -t "$rc_conf" "$i" >/dev/null 2>&1; done
+  for i in 1 2 3 4 5; do run --no-verify -q --force --keep 2 -t "$rc_conf" "$i" >/dev/null 2>&1; done
   assert_eq "--keep 2 retains exactly 2 backups" "2" \
     "$(count_baks "$rc_conf")"
 
   # 11 — same-second backups must not collide
   rm -f "${rc_conf}".bak.* 2>/dev/null || true
-  run --no-verify -q -t "$rc_conf" 1 >/dev/null 2>&1
-  run --no-verify -q -t "$rc_conf" 2 >/dev/null 2>&1
-  run --no-verify -q -t "$rc_conf" 3 >/dev/null 2>&1
+  run --no-verify -q --force -t "$rc_conf" 1 >/dev/null 2>&1
+  run --no-verify -q --force -t "$rc_conf" 2 >/dev/null 2>&1
+  run --no-verify -q --force -t "$rc_conf" 3 >/dev/null 2>&1
   assert_eq "3 rapid writes keep 3 distinct backups" "3" \
     "$(count_baks "$rc_conf")"
 
@@ -820,7 +968,7 @@ selftest() {
   local ldir="${tmp}/link" real="${tmp}/real.conf"
   mkdir -p "$ldir"; printf 'nameserver 10.7.7.7\n' > "$real"
   ln -s "$real" "${ldir}/resolv.conf"
-  run --no-verify -q -t "${ldir}/resolv.conf" opendns >/dev/null 2>&1
+  run --no-verify -q --force -t "${ldir}/resolv.conf" opendns >/dev/null 2>&1
   assert_true "symlink still a symlink" test -L "${ldir}/resolv.conf"
   assert_true "content written through the link" grep -q '^nameserver 208.67.222.222$' "$real"
 
@@ -830,9 +978,39 @@ selftest() {
   run --no-verify -q -t "${ldir}/resolv.conf" --restore >/dev/null 2>&1
   assert_true "--restore recreated the symlink" test -L "${ldir}/resolv.conf"
 
-  # 14 -- verify reports unreachable servers without crashing
+  # 14 — verify reports unreachable servers without crashing
   rc=0; run -q -t "$rc_conf" --verify "240.0.0.1" >/dev/null 2>&1 || rc=$?
   assert_eq "--verify flags an unreachable server" "1" "$rc"
+
+  # 15 — external profile: add, override and validate
+  local prof="${tmp}/profile.txt"
+  {
+    printf '# comment line\n'
+    printf 'home|HomePiHole|192.168.1.10||LAN ad blocker.|\n'
+    printf 'google|GoogleCustomPin|8.8.8.8 8.8.4.4||custom pin test|DEADBEEF\n'
+  } > "$prof"
+  run --profile "$prof" --list >/dev/null 2>&1
+  assert_true "--profile adds a new key to the listing" grep -q "HomePiHole" <(run --profile "$prof" --list 2>/dev/null)
+  assert_true "--profile overrides a built-in label"   grep -q "GoogleCustomPin" <(run --profile "$prof" --list 2>/dev/null)
+  run --no-verify -q --force --profile "$prof" -t "$rc_conf" home >/dev/null 2>&1
+  assert_true "profile entry applies its servers" grep -q '^nameserver 192.168.1.10$' "$rc_conf"
+  printf 'evil|Bad|999.1.1.1|||\n' > "${tmp}/bad-profile.txt"
+  assert_false "rejects invalid IP in profile file" run --profile "${tmp}/bad-profile.txt" --list
+
+  # 16 — systemd drop-in generation (fake systemctl on PATH for the test)
+  local fakebin="${tmp}/bin" ddir="${tmp}/resolved.conf.d"
+  mkdir -p "$fakebin" "$ddir"
+  printf '#!/bin/sh\nexit 0\n' > "${fakebin}/systemctl"; chmod +x "${fakebin}/systemctl"
+  local old_path="$PATH"
+  PATH="${fakebin}:$PATH"
+  run --dropin-dir "$ddir" --dot cloudflare --dry-run >/dev/null 2>&1
+  assert_false "drop-in dry-run writes nothing" test -s "${ddir}/setdns.conf"
+  run --dropin-dir "$ddir" --dot cloudflare >/dev/null 2>&1
+  assert_true "drop-in written"                test -s "${ddir}/setdns.conf"
+  assert_true "drop-in pins DoT fingerprint"   grep -q 'DNS=1\.1\.1\.1~D7A7D0F5.*' "${ddir}/setdns.conf"
+  assert_true "drop-in enables DNSOverTLS"     grep -q '^DNSOverTLS=yes$' "${ddir}/setdns.conf"
+  assert_true "drop-in has [Resolve] section"  grep -q '^\[Resolve\]$' "${ddir}/setdns.conf"
+  PATH="$old_path"
 
   echo
   if (( fail == 0 )); then
@@ -912,7 +1090,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help)      usage; exit 0 ;;
     -V|--version)   echo "setdns.sh ${VERSION}"; exit 0 ;;
-    -l|--list)      list_providers; exit 0 ;;
+    -l|--list)      if [[ -n "${PROFILE_FILE:-}" ]]; then load_profile "$PROFILE_FILE"; fi
+                    list_providers; exit 0 ;;
     -c|--current)   show_current; exit 0 ;;
     -b|--backups)   if [[ -z "$(newest_backup)" ]]; then
                       warn "No backups found for ${TARGET}."
@@ -941,6 +1120,12 @@ while [[ $# -gt 0 ]]; do
     -f|--force)     FORCE=1; shift ;;
     --replace-symlink) REPLACE_SYMLINK=1; shift ;;
     --no-verify)    VERIFY_AFTER=0; shift ;;
+    --profile)      PROFILE_MODE=1; PROFILE_FILE="${2:---profile needs a file}"; shift 2 ;;
+    --dropin-dir)   PROFILE_MODE=1; DROPIN_DIR="${2:---dropin-dir needs a path}"; shift 2 ;;
+    --dot)          PROFILE_MODE=1; DOT_MODE=1; shift ;;
+    --make-profile) shift
+                    if [[ $# -gt 0 && "${1:0:1}" != "-" ]]; then load_profile "$1"; fi
+                    make_profile; exit 0 ;;
     -q|--quiet)     QUIET=1; shift ;;
     --)             shift; while [[ $# -gt 0 ]]; do POSITIONAL+=("$1"); shift; done; break ;;
     -*)             die "Unknown option: $1 (see --help)" ;;
@@ -949,6 +1134,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ${#POSITIONAL[@]} -gt 0 ]]; then set -- "${POSITIONAL[@]}"; else set --; fi
+
+# Load an external profile before anything else touches the provider table.
+if [[ -n "$PROFILE_FILE" ]]; then load_profile "$PROFILE_FILE"; fi
 
 # --------------------------------------------------------------------------
 # Main
